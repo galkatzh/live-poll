@@ -1,0 +1,14 @@
+{
+  "name": "live-poll",
+  "private": true,
+  "description": "Serverless live audience polls: a phone page, a results board, and a tiny MQTT protocol",
+  "scripts": {
+    "vendor": "node vendor.js",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "mqtt": "5.16.0",
+    "qrcode-generator": "2.0.4"
+  }
+}
