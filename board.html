@@ -13,7 +13,9 @@
   board.html#r=<room>                host the room with the questions saved for it
   board.html#r=<room>&s=<set>        …with the questions carried in the link
   board.html#r=<room>&watch=1        watch a room another host runs (read-only)
-  Also: &b=wss://a,wss://b  &p=<prefix>  &t=local  &join=<phone page URL>
+  Also: &b=wss://a,wss://b (MQTT brokers)  &n=wss://a,wss://b (Nostr relays)
+        &t=mqtt|nostr|mqtt+nostr|local  &p=<prefix>  &join=<phone page URL>
+        &h=<hex public key> (watch mode: check the host's signature on Nostr)
 
   Keys (host): → / Space / PageDown next · ← / PageUp previous · Home lobby
                O open/close · R reveal · X blank the phones · E export votes
@@ -117,7 +119,7 @@
 <section id="setup" hidden>
   <h1>Live poll board</h1>
   <p class="lede">Write your questions, start, and put this window on the projector next to your slides. The audience scans the QR code once
-    and their phones follow the board from question to question. No account and no server: votes go through public MQTT brokers, under a random room code.</p>
+    and their phones follow the board from question to question. No account and no server: votes go through public MQTT brokers and Nostr relays, under a random room code.</p>
   <div class="grid">
     <div>
       <label class="field" for="poll-title">Title (shown on phones)</label>
@@ -145,9 +147,11 @@
       <div class="row"><input type="text" id="room" maxlength="64" spellcheck="false"><button class="btn" id="new-room" title="A fresh random room">New</button></div>
       <p class="help" style="padding:10px 14px">Use a fresh room for every talk. Anyone who knows the code can see the votes, so keep it random.</p>
       <details>
-        <summary>Advanced: brokers, topic prefix, watching</summary>
-        <label class="field" for="brokers" style="margin-top:12px">Brokers (comma-separated, wss:// only)</label>
+        <summary>Advanced: brokers, relays, topic prefix, watching</summary>
+        <label class="field" for="brokers" style="margin-top:12px">MQTT brokers (comma-separated, wss:// only)</label>
         <div class="row"><input type="text" id="brokers" spellcheck="false"></div>
+        <label class="field" for="relays">Nostr relays (comma-separated, wss:// only)</label>
+        <div class="row"><input type="text" id="relays" spellcheck="false"></div>
         <label class="field" for="prefix">Topic prefix</label>
         <div class="row"><input type="text" id="prefix" spellcheck="false" maxlength="40"></div>
         <button class="btn" id="watch">Watch this room instead (read-only)</button>
@@ -182,6 +186,7 @@
 <div id="helpbox" hidden></div>
 
 <script src="mqtt.min.js"></script>
+<script src="nostr.bundle.js"></script>
 <script src="qrcode.js"></script>
 <script src="transport.js"></script>
 <script src="host.js"></script>
@@ -275,9 +280,12 @@
 
   // ── where things live ────────────────────────────────────────────────────
   const prefix = params.get("p") || T.DEFAULT_PREFIX;
-  const kind = params.get("t") === "local" ? "local" : "mqtt";
+  let kind = T.DEFAULT_KIND;
+  try { kind = T.kindList(params.get("t") || T.DEFAULT_KIND).join("+"); } catch (e) { /* unknown: the default */ }
   const brokers = params.get("b") ? params.get("b").split(",") : undefined;
+  const relays = params.get("n") ? params.get("n").split(",") : undefined;
   const watch = params.get("watch") === "1";
+  const hostKey = /^[0-9a-f]{64}$/.test(params.get("h") || "") ? params.get("h") : null;
   const setKey = (room) => `live-poll/board/${prefix}/${room}`;
   const posKey = (room) => `live-poll/board-pos/${prefix}/${room}`;
   const joinBase = params.get("join") || new URL("index.html", location.href).href;
@@ -286,12 +294,14 @@
     const q = new URLSearchParams();
     q.set("r", room);
     if (params.get("b")) q.set("b", params.get("b"));
+    if (params.get("n")) q.set("n", params.get("n"));
     if (params.get("p")) q.set("p", params.get("p"));
-    if (kind === "local") q.set("t", "local");
+    if (kind !== T.DEFAULT_KIND) q.set("t", kind);
     Object.entries(extra || {}).forEach(([k, v]) => q.set(k, v));
-    return q.toString().replace(/%2C/g, ",").replace(/%3A/g, ":").replace(/%2F/g, "/");
+    return q.toString().replace(/%2C/g, ",").replace(/%3A/g, ":").replace(/%2F/g, "/").replace(/%2B/g, "+");
   }
-  const joinUrl = (room) => joinBase + "#" + linkParams(room);
+  // Phones take the question only from this board's Nostr key.
+  const joinUrl = (room, pubkey) => joinBase + "#" + linkParams(room, pubkey ? { h: pubkey } : {});
 
   // ── setup view ───────────────────────────────────────────────────────────
   function showSetup(room) {
@@ -303,6 +313,7 @@
     $("poll-text").value = saved ? toText(Object.assign({}, saved, { title: "" })) : EXAMPLE.replace(/^title:.*\n\n/, "");
     if (!saved) $("poll-title").value = "Live poll demo";
     $("brokers").value = (brokers || T.DEFAULT_BROKERS).join(", ");
+    $("relays").value = (relays || T.DEFAULT_RELAYS).join(", ");
     $("prefix").value = prefix;
     check();
   }
@@ -337,6 +348,8 @@
     const bl = $("brokers").value.split(",").map((s) => s.trim()).filter(Boolean);
     const defaults = T.DEFAULT_BROKERS.join(",");
     if (bl.length && bl.join(",") !== defaults) extra.b = T.brokerList(bl).join(",");
+    const rl = $("relays").value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (rl.length && rl.join(",") !== T.DEFAULT_RELAYS.join(",")) extra.n = T.relayList(rl).join(",");
     const px = $("prefix").value.trim();
     if (px && px !== T.DEFAULT_PREFIX) extra.p = px;
     return extra;
@@ -347,7 +360,7 @@
     const { set } = current();
     const q = new URLSearchParams({ r: room });
     Object.entries(advancedParams()).forEach(([k, v]) => q.set(k, v));
-    if (kind === "local") q.set("t", "local");
+    if (kind !== T.DEFAULT_KIND) q.set("t", kind);
     if (withSet) q.set("s", b64.enc(set));
     return location.href.split("#")[0] + "#" + q.toString();
   }
@@ -387,9 +400,11 @@
   function startBoard(room, set) {
     $("setup").hidden = true;
     $("board").hidden = false;
-    const url = joinUrl(room);
+    const key = !watch && kind.includes("nostr") ? LivePollHost.key({ room, prefix }) : null;
+    const url = joinUrl(room, key && key.pubkey);
     document.querySelectorAll("[data-qr]").forEach((el) => (el.innerHTML = qrSvg(url)));
-    document.querySelectorAll("[data-join-url]").forEach((el) => (el.textContent = url.replace(/^https?:\/\//, "")));
+    // The printed link is for typing by hand: without the key (see index.html).
+    document.querySelectorAll("[data-join-url]").forEach((el) => (el.textContent = url.replace(/^https?:\/\//, "").replace(/&h=[0-9a-f]{64}/, "")));
     $("room-label").textContent = (watch ? "watching room " : "room ") + room;
 
     const polls = set ? toPolls(set) : [];
@@ -439,13 +454,15 @@
       const st = host.status();
       const link = $("link");
       link.className = "link " + (!st.total || !st.up ? "" : st.up < st.total ? "part" : "up");
-      link.textContent = st.total ? `${st.up}/${st.total} ${kind === "local" ? "local" : "brokers"}` : "offline";
+      const names = { mqtt: "MQTT", nostr: "Nostr", local: "local" };
+      link.textContent = st.total ? st.links.map((l) => `${names[l.kind] || l.kind} ${l.up}/${l.total}`).join(" · ") : "offline";
       $("joined").textContent = host.joined() + " joined";
       $("lobby-joined").textContent = host.joined();
     }
 
     host = LivePollHost.create({
-      room, prefix, kind, brokers, mode: watch ? "watch" : "host", polls,
+      room, prefix, kind, brokers, relays, mode: watch ? "watch" : "host", polls,
+      nostrKey: key && key.secret, hostKey,
       meta: { title: set ? set.title : "", scoreText: "You got {right} of {total} right" },
       onChange: render,
     });
@@ -487,6 +504,7 @@
     $("bigqr").addEventListener("click", () => ($("bigqr").hidden = true));
     window.LivePollBoard.host = host;
     window.LivePollBoard.go = go;
+    window.LivePollBoard.joinUrl = url;
   }
 
   window.LivePollBoard = { parse, toText, toPolls, b64 };

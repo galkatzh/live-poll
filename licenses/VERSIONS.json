@@ -1,4 +1,9 @@
 {
   "mqtt": "5.16.0",
-  "qrcode-generator": "2.0.4"
+  "qrcode-generator": "2.0.4",
+  "nostr-tools": "2.25.2",
+  "@noble/curves": "2.0.1",
+  "@noble/hashes": "2.0.1",
+  "@noble/ciphers": "2.1.1",
+  "@scure/base": "2.0.0"
 }

@@ -10,8 +10,12 @@
 // What a host counts is mirrored to localStorage under its room, so a reload
 // mid-talk loses nothing; the retained votes on the brokers are a second copy.
 //
-//   const host = LivePollHost.create({room, prefix, kind, brokers, polls, meta, onChange})
-//     kind      "mqtt" (default) | "local" | "none" (render only, never connect)
+//   const host = LivePollHost.create({room, prefix, kind, brokers, relays, polls, meta, onChange})
+//     kind      "mqtt+nostr" (default) | "mqtt" | "nostr" | "local" | "none" (render only, never connect)
+//     nostrKey  the host's secret key (hex); default LivePollHost.key({room, prefix}),
+//               kept in localStorage. Phones given its public key (h= in their
+//               link) take the question only from events it signed.
+//     hostKey   watch mode: that public key, to check the host's state the same way
 //     polls     [{id, prompt, options, kicker?, layout?, answer?, scored?}]
 //     meta      {title?, scoreText?} sent to the phones with every state
 //     mode      "host" (default) | "watch": a read-only mirror of a room that
@@ -22,7 +26,10 @@
 //   host.show(id | null)      the question phones should display (null: waiting screen)
 //   host.toggleOpen() / reveal() / idle()
 //   host.counts(id) / votes(id) / poll(id) / current() / joined() / status()
-//   host.isOpen(id) / isRevealed(id) / exportJSON() / purge() / close()
+//   host.isOpen(id) / isRevealed(id) / exportJSON() / purge() / close() / pubkey()
+//
+//   LivePollHost.key({room, prefix}) → {secret, pubkey}: the stored host key
+//     (created on first use), for putting h=<pubkey> into the join link
 (function (global) {
   "use strict";
 
@@ -30,6 +37,12 @@
   const QID = /^[A-Za-z0-9_-]{1,64}$/;
   const MAX_OPTIONS = 12;
   const clip = (s, n) => String(s == null ? "" : s).slice(0, n);
+  const HEX64 = /^[0-9a-f]{64}$/;
+
+  function key(opts) {
+    const prefix = opts.prefix || global.LivePollTransport.DEFAULT_PREFIX;
+    return global.LivePollTransport.keypair(`live-poll/${prefix}/${opts.room}/host-key`);
+  }
 
   function create(opts) {
     const mode = opts.mode === "watch" ? "watch" : "host";
@@ -40,13 +53,15 @@
     let polls = {};
     let current = null;
     let transport = null;
-    let link = { up: 0, total: 0 };
+    let link = { up: 0, total: 0, links: [] };
     let saveTimer = null;
+    let lastT = 0;          // the newest state sent (host) or seen (watch)
     const watched = { open: {}, revealed: {} };   // watch mode: as the host last said
 
     (opts.polls || []).forEach((p) => (polls[p.id] = p));
 
-    const empty = () => ({ votes: {}, open: {}, revealed: {}, joined: {} });
+    // purged: q → voter → t of a vote purge() dropped (see there).
+    const empty = () => ({ votes: {}, open: {}, revealed: {}, joined: {}, purged: {} });
     function load() {
       if (mode === "watch") return empty();
       try {
@@ -82,7 +97,9 @@
 
     function stateFor(id) {
       const p = id && polls[id];
-      const base = { v: 1, title: meta.title || "", scoreText: meta.scoreText || "" };
+      // t orders states that reach a phone by different routes; it only grows.
+      lastT = Math.max(Date.now(), lastT + 1);
+      const base = { v: 1, t: lastT, title: meta.title || "", scoreText: meta.scoreText || "" };
       if (!p) return Object.assign(base, { q: null });
       const revealed = isRevealed(id);
       return Object.assign(base, {
@@ -97,6 +114,10 @@
 
     // Watch mode: learn the question from the host's own state message.
     function onState(s) {
+      if (s && typeof s.t === "number") {
+        if (s.t < lastT) return;           // an older state, arriving late by another route
+        lastT = s.t;
+      }
       if (!s || !s.q || !QID.test(String(s.q))) {
         current = null;
         onChange("show");
@@ -131,6 +152,8 @@
         const votes = (store.votes[q] = store.votes[q] || {});
         const old = votes[voter];
         if (old && old.t >= t) return;                  // a duplicate or an older copy
+        const gone = store.purged[q] && store.purged[q][voter];
+        if (gone && t <= gone) return;                  // purged, and replayed by a relay
         // A vote that arrives live after the poll closed does not count. One
         // replayed from a broker's retained store (after a reload or reconnect)
         // was cast earlier, while phones could still vote, so it does.
@@ -148,13 +171,25 @@
       }
     }
 
-    if (opts.kind !== "none") {
+    const kinds = opts.kind === "none" ? [] : global.LivePollTransport.kindList(opts.kind);
+    let nostrKey = null;
+    if (kinds.includes("nostr") && mode === "host") {
+      const k = HEX64.test(opts.nostrKey || "") ? { secret: opts.nostrKey } : key({ room: opts.room, prefix });
+      nostrKey = k && k.secret;
+    }
+    let pubkey = null;
+    if (nostrKey && global.NostrTools) {
+      pubkey = global.NostrTools.getPublicKey(global.NostrTools.utils.hexToBytes(nostrKey));
+    }
+
+    if (kinds.length) {
       transport = global.LivePollTransport.create({
-        kind: opts.kind || "mqtt", room: opts.room, prefix, brokers: opts.brokers, clientId: mode,
+        kind: kinds.join("+"), room: opts.room, prefix, brokers: opts.brokers, relays: opts.relays, clientId: mode,
+        nostrKey, trusted: mode === "watch" && HEX64.test(opts.hostKey || "") ? { state: opts.hostKey } : undefined,
         subscribe: mode === "watch" ? ["state", "v/#", "hello/#"] : ["v/#", "hello/#"],
         onMessage,
-        onStatus(up, total) {
-          link = { up, total };
+        onStatus(up, total, links) {
+          link = { up, total, links: links || [] };
           onChange("status");
         },
         // Re-assert the current question after every (re)connect: a broker
@@ -210,6 +245,7 @@
       },
       joined: () => Object.keys(store.joined).length,
       status: () => link,
+      pubkey: () => pubkey,
       isOpen,
       isRevealed,
       exportJSON(download = true) {
@@ -230,15 +266,23 @@
         }
         return out;
       },
-      // After a rehearsal: forget every vote here and on the brokers.
+      // After a rehearsal: forget every vote here and on the brokers. Nostr
+      // relays keep each vote under the phone's own key, which only the phone
+      // can replace, so the votes dropped here are remembered (by q, voter and
+      // t) and their replays ignored until the relays let them expire.
       purge() {
         if (mode === "watch") return;
         if (transport) {
           Object.entries(store.votes).forEach(([q, vs]) => Object.keys(vs).forEach((voter) => transport.publish(`v/${q}/${voter}`, null, { retain: true })));
           transport.publish("state", null, { retain: true });
         }
-        store = empty();
-        try { localStorage.removeItem(storeKey); } catch (e) { /* ignore */ }
+        const purged = store.purged;
+        Object.entries(store.votes).forEach(([q, vs]) => Object.entries(vs).forEach(([voter, v]) => {
+          purged[q] = purged[q] || {};
+          purged[q][voter] = Math.max(purged[q][voter] || 0, v.t);
+        }));
+        store = Object.assign(empty(), { purged });
+        save(true);
         onChange("purge");
       },
       close() {
@@ -249,5 +293,5 @@
     };
   }
 
-  global.LivePollHost = { create };
+  global.LivePollHost = { create, key };
 })(typeof window !== "undefined" ? window : globalThis);

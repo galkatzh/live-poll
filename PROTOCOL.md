@@ -1,6 +1,6 @@
 # live-poll protocol, version 1
 
-The protocol connects a **host** (a slide deck, or `board.html`) to **phones** (`index.html`) over MQTT. The host publishes what the phones should show. The phones publish votes. The phone page has no questions of its own, so any host that speaks this protocol can drive it.
+The protocol connects a **host** (a slide deck, or `board.html`) to **phones** (`index.html`) over MQTT, Nostr, or both at once. The host publishes what the phones should show. The phones publish votes. The phone page has no questions of its own, so any host that speaks this protocol can drive it.
 
 `transport.js` and `host.js` implement both sides. Use them if you can, or write your own client from this page.
 
@@ -16,7 +16,7 @@ All topics hang off a base of `<prefix>/<room>/`.
 | `v/<q>/<voter>` | phone | yes | `{"choice": <option index>, "t": <ms since epoch>}` |
 | `hello/<voter>` | phone | no | `{"t": <ms>}`, sent on every (re)connect, for a "joined" count |
 
-Payloads are JSON objects, published with QoS 1. An empty payload clears a retained message.
+Payloads are JSON objects. An empty payload clears a retained message. Over MQTT they are published with QoS 1; for Nostr, see [Transport](#transport).
 
 - `<q>` is a question id matching `[A-Za-z0-9_-]{1,64}`. Change the id whenever the question changes; phones remember their vote per id.
 - `<voter>` matches `[A-Za-z0-9]{4,40}`. A phone picks it at random once and keeps it in localStorage.
@@ -26,6 +26,7 @@ Payloads are JSON objects, published with QoS 1. An empty payload clears a retai
 ```json
 {
   "v": 1,
+  "t": 1793001234567,
   "title": "Lab meeting",
   "scoreText": "You got {right} of {total} right",
   "q": "a1b2c3-2",
@@ -43,6 +44,7 @@ Payloads are JSON objects, published with QoS 1. An empty payload clears a retai
 | Field | Meaning |
 |---|---|
 | `v` | Protocol version. Always `1` for now. |
+| `t` | When the host sent it, in ms since the epoch, and larger than any `t` it sent before. A phone ignores a `state` older than the last one it showed: with two transports, the same sequence of states can arrive in a different order by each route. Optional; a state without it is always shown. |
 | `title` | Shown in the phone's header and tab title (≤ 80 characters). |
 | `scoreText` | The running-score line. `{right}` and `{total}` are filled in from the phone's own record of `scored` questions. Empty means `"{right} of {total} right"`. |
 | `q` | The question id. `null` (or a `state` with no `q`) shows the waiting screen; the other fields are then ignored. |
@@ -60,35 +62,73 @@ All text is rendered as plain text, never HTML. Longer strings are clipped.
 ## Rules a host should follow
 
 - **Keep `state` retained, and re-publish it after every (re)connect.** A phone that joins or reloads then lands on the current question at once.
+- **Stamp every `state` with a growing `t`.**
 - **Count each voter once per question, by `(q, voter)`.** Keep the vote with the largest `t`: a duplicate or an older copy (from a second broker, or a retained replay) must not overwrite a newer one.
 - **Ignore malformed votes:** `choice` not an integer index of `options`, `t` not a number, an unknown `q`, or a bad voter id.
-- **After closing a poll, ignore live votes but accept retained replays.** A replayed vote (the MQTT retain flag is set on delivery) was cast while voting was open.
-- **Clean up after a rehearsal** by publishing empty retained payloads to the vote topics and to `state`. `host.purge()` does this.
+- **After closing a poll, ignore live votes but accept retained replays.** A replayed vote was cast while voting was open. On MQTT the retain flag is set on delivery; on Nostr it arrives before the relay's end-of-stored-events marker.
+- **Clean up after a rehearsal.**
+  - MQTT: publish empty retained payloads to the vote topics and to `state`.
+  - Nostr: a relay keeps each vote under the phone's key, which only the phone can replace. So a host also remembers each vote it purged, by `(q, voter, t)`, and ignores replays of it and older copies. The relays drop the votes when they expire.
+  - `host.purge()` does all of this.
 
 ## Transport
 
-Phones and hosts connect to **every** broker in their list at once:
+A link names its transports with `t=`: `mqtt`, `nostr`, or both, `mqtt+nostr`, which is the default. With both, everything is published on both, and the de-duplication above makes the second copy harmless.
+
+Phones and hosts connect to **every** broker or relay in their lists at once:
 - publish to all of them;
 - subscribe on all of them;
 - de-duplicate as above.
 
-One broker going down then changes nothing.
+One broker or relay going down then changes nothing.
 
-The default brokers are free public ones:
+For rehearsals with no network, `t=local` swaps both for a BroadcastChannel between tabs of one browser. Retained messages are emulated.
+
+### MQTT
+
+Topics are the base plus the topic above. The default brokers are free public ones:
 
 ```
 wss://broker.hivemq.com:8884/mqtt
 wss://broker.emqx.io:8084/mqtt
 ```
 
-A link may name others with `b=` (comma-separated). Only `wss://` URLs are accepted, plus `ws://localhost` / `ws://127.0.0.1` for testing against a local broker.
+A link may name others with `b=` (comma-separated).
 
-For rehearsals with no network, `t=local` swaps MQTT for a BroadcastChannel between tabs of one browser. Retained messages are emulated.
+### Nostr
+
+Each message is a signed Nostr event ([NIP-01](https://github.com/nostr-protocol/nips/blob/master/01.md)) whose content is the JSON payload, or `""` to clear.
+
+| | Retained (`state`, votes) | Not retained (`hello`) |
+|---|---|---|
+| Kind | `30078`, addressable ([NIP-78](https://github.com/nostr-protocol/nips/blob/master/78.md)): a relay keeps only the latest event per signer and `d` tag | `20078`, ephemeral: relayed to current subscribers, never stored |
+| `d` tag | the full topic, `<prefix>/<room>/<topic>` | the same |
+| `y` tag | the base plus the topic's first level, e.g. `live-poll/<room>/v`; subscriptions filter on it (`"#y"`) | the same |
+| `expiration` tag | `created_at` + 24 h ([NIP-40](https://github.com/nostr-protocol/nips/blob/master/40.md)); relays drop the event then | none |
+
+Rules for Nostr clients:
+- **`created_at` must grow for each topic.** It is in whole seconds, and a relay keeps the newer of two versions, so a second update within the same second is dated one second later. `transport.js` keeps these clocks in localStorage, so they survive a reload.
+- **Keep one key per host, across reloads.** Phones are given its public key as `h=<64 hex digits>` in their link. They then take `state` only from events that key signed, filtering by author at the relay and checking the signature themselves. A phone without `h=` takes any well-formed `state`, as on MQTT.
+- **Phones sign with a key of their own,** kept in localStorage. It identifies nothing; the voter id inside the topic is what counts.
+- **Read every stored event.** Relays cap how many stored events one request returns, so ask for older pages (`until`) while pages come back full of unseen events.
+
+The default relays are free public ones that accepted these kinds and took 30 phones joining from one address, as a venue's router would make them:
+
+```
+wss://relay.primal.net
+wss://relay.nostr.net
+wss://nostr.oxtr.dev
+wss://nostr-pub.wellorder.net
+```
+
+A link may name others with `n=` (comma-separated). `node tests/relay-check.mjs` re-checks the defaults, or any relays you name.
+
+Broker and relay lists accept only `wss://` URLs, plus `ws://localhost` / `ws://127.0.0.1` for testing against a local server.
 
 ## Phone page URL
 
 ```
-index.html#r=<room>[&b=<broker,broker>][&p=<prefix>][&t=local][&voter=<id>]
+index.html#r=<room>[&h=<host key>][&t=mqtt|nostr|mqtt+nostr|local][&b=<broker,…>][&n=<relay,…>][&p=<prefix>][&voter=<id>]
 ```
 
 Everything is in the fragment, so none of it reaches the web server. `voter=` pins the voter id; it is for tests that run several "phones" as tabs of one browser.

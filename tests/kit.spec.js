@@ -177,15 +177,31 @@ test("broker lists from a link: wss:// only, else the defaults", async ({ page }
   expect(r.undef).toEqual(r.defaults);
 });
 
+test("relay lists and transport kinds", async ({ page }) => {
+  await page.goto(PHONE + "#r=abcdefgh");
+  const r = await page.evaluate(() => {
+    const T = LivePollTransport;
+    const kind = (k) => { try { return T.kindList(k); } catch (e) { return "error"; } };
+    return {
+      relays: T.relayList(["https://x.example", "wss://relay.example", "ws://127.0.0.1:7777"]),
+      none: T.relayList([]), defaults: T.DEFAULT_RELAYS,
+      kinds: [kind(undefined), kind("mqtt"), kind("nostr+mqtt+nostr"), kind("mqtt+carrier-pigeon")],
+    };
+  });
+  expect(r.relays).toEqual(["wss://relay.example", "ws://127.0.0.1:7777"]);
+  expect(r.none).toEqual(r.defaults);
+  expect(r.kinds).toEqual([["mqtt", "nostr"], ["mqtt"], ["nostr", "mqtt"], "error"]);
+});
+
 test("no callback before create() returns, on either transport", async ({ page }) => {
   // The board's render reads the host that create() returns; the MQTT
   // transport used to report its status before that, and the board crashed.
   await page.goto(BOARD + "#t=local");
   const early = await page.evaluate(async (room) => {
     const calls = [];
-    for (const kind of ["mqtt", "local"]) {
+    for (const kind of ["mqtt", "local", "nostr", "mqtt+nostr"]) {
       let returned = false;
-      const h = LivePollHost.create({ room, kind, brokers: ["ws://localhost:9"], polls: [], onChange: (w) => calls.push([kind, w, returned]) });
+      const h = LivePollHost.create({ room, kind, brokers: ["ws://localhost:9"], relays: ["ws://localhost:9"], polls: [], onChange: (w) => calls.push([kind, w, returned]) });
       returned = true;
       await new Promise((r) => setTimeout(r, 50));
       h.close();
@@ -196,22 +212,29 @@ test("no callback before create() returns, on either transport", async ({ page }
 });
 
 test.describe("live", () => {
-  test.skip(!process.env.LIVE, "set LIVE=1 to run against the public brokers");
-  test("board and phone over the public brokers", async ({ context }) => {
-    test.setTimeout(90000);
-    const board = await context.newPage();
-    await board.goto(BOARD);
-    await board.fill("#room", room);
-    await board.fill("#poll-text", SET);
-    await board.click("#start");
-    await expect(board.locator("#link")).toHaveText(/2\/2 brokers/, { timeout: 20000 });
-    await board.keyboard.press("ArrowRight");
-    const p = await context.newPage();
-    await p.goto(`${PHONE}#r=${room}&voter=livephone1`);
-    await expect(p.locator("#prompt")).toHaveText("Pick a colour", { timeout: 20000 });
-    await p.getByRole("button", { name: "green" }).click();
-    await expect(board.locator("#total")).toHaveText("1", { timeout: 20000 });
-    await board.evaluate(() => LivePollBoard.host.purge());
-    await board.waitForTimeout(1000);
-  });
+  test.skip(!process.env.LIVE, "set LIVE=1 to run against the public brokers and relays");
+  for (const kind of ["nostr", "mqtt+nostr"]) {
+    test(`board and phone over the public ${kind === "nostr" ? "relays" : "brokers and relays"}`, async ({ context }) => {
+      test.setTimeout(90000);
+      const board = await context.newPage();
+      await board.goto(`${BOARD}#t=${kind}`);
+      await board.fill("#room", room);
+      await board.fill("#poll-text", SET);
+      await board.click("#start");
+      await expect(board.locator("#link")).toHaveText(/Nostr [1-9]\/4/, { timeout: 20000 });
+      const join = await board.evaluate(() => LivePollBoard.joinUrl);
+      await board.keyboard.press("ArrowRight");
+      const p = await context.newPage();
+      const t0 = Date.now();
+      await p.goto(`${join}&voter=livephone1`);
+      await expect(p.locator("#prompt")).toHaveText("Pick a colour", { timeout: 20000 });
+      console.log(`${kind}: question on the phone after ${Date.now() - t0} ms; board: ${await board.locator("#link").textContent()}`);
+      const t1 = Date.now();
+      await p.getByRole("button", { name: "green" }).click();
+      await expect(board.locator("#total")).toHaveText("1", { timeout: 20000 });
+      console.log(`${kind}: vote counted after ${Date.now() - t1} ms`);
+      await board.evaluate(() => LivePollBoard.host.purge());
+      await board.waitForTimeout(1500);
+    });
+  }
 });

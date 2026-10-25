@@ -12,8 +12,11 @@
   and it sends back one vote per question, changeable until the host closes
   the poll. All text from the host is shown as plain text. See PROTOCOL.md.
 
-  index.html#r=<room>                       the default public brokers
-  index.html#r=<room>&b=wss://a,wss://b     other brokers (wss:// only)
+  index.html#r=<room>                       the default public MQTT brokers and Nostr relays
+  index.html#r=<room>&h=<hex public key>    take the question only from that host (Nostr)
+  index.html#r=<room>&b=wss://a,wss://b     other MQTT brokers (wss:// only)
+  index.html#r=<room>&n=wss://a,wss://b     other Nostr relays (wss:// only)
+  index.html#r=<room>&t=mqtt                one kind only: mqtt | nostr | mqtt+nostr (default)
   index.html#r=<room>&p=<prefix>            another topic prefix
   index.html#r=<room>&t=local               BroadcastChannel (rehearsal, tests)
 -->
@@ -106,6 +109,7 @@
 </main>
 <div id="score"></div>
 <script src="mqtt.min.js"></script>
+<script src="nostr.bundle.js"></script>
 <script src="transport.js"></script>
 <script>
 (function () {
@@ -114,8 +118,11 @@
   const params = new URLSearchParams(location.hash.slice(1));
   const room = params.get("r") || "";
   const prefix = params.get("p") || T.DEFAULT_PREFIX;
-  const kind = params.get("t") === "local" ? "local" : "mqtt";
+  let kind = T.DEFAULT_KIND;
+  try { kind = T.kindList(params.get("t") || T.DEFAULT_KIND).join("+"); } catch (e) { /* unknown: the default */ }
   const brokers = params.get("b") ? params.get("b").split(",") : undefined;
+  const relays = params.get("n") ? params.get("n").split(",") : undefined;
+  const hostKey = /^[0-9a-f]{64}$/.test(params.get("h") || "") ? params.get("h") : null;
   const $main = document.getElementById("main");
   const $conn = document.getElementById("conn");
   const $score = document.getElementById("score");
@@ -139,6 +146,7 @@
   const mine = store.get(mineKey, {});   // q -> {choice, answer, scored}
 
   let state = null;       // the last state the host sent
+  let stateT = 0;         // its time stamp: an older state arriving late by another route is ignored
   let scoreText = "";     // the host's wording for the running score
   let pending = null;     // {q, choice} not yet acknowledged by any broker
   let transport = null;
@@ -249,6 +257,10 @@
 
   function onState(s) {
     if (!s || typeof s !== "object") return;
+    if (typeof s.t === "number") {
+      if (s.t < stateT) return;
+      stateT = s.t;
+    }
     const title = clip(s.title, 80) || "Live poll";
     $title.textContent = title;
     document.title = title;
@@ -275,8 +287,11 @@
 
   if (!room || !T.ROOM.test(room)) { render(); return; }
   try {
+    // The phone signs its Nostr events with a key of its own, kept like the voter id.
+    const key = kind.includes("nostr") ? T.keypair("live-poll/nostr-key") : null;
     transport = T.create({
-      kind, room, prefix, brokers, clientId: "phone-" + voter.slice(0, 8),
+      kind, room, prefix, brokers, relays, clientId: "phone-" + voter.slice(0, 8),
+      nostrKey: key && key.secret, trusted: hostKey ? { state: hostKey } : undefined,
       subscribe: ["state"],
       onMessage(sub, payload) { if (sub === "state") onState(payload || { q: null }); },
       onStatus(up) {
